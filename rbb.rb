@@ -28,6 +28,8 @@ class Server
   attr_reader :directories
   attr_reader :datestamp
   attr_reader :all_directories
+  attr_reader :links
+  attr_reader :syncs
   def initialize
     @hostname = "localhost"
     @user = ""
@@ -90,6 +92,40 @@ class Server
     end
   end
   
+  def get_remote_hashes
+    IO.popen("ssh #{@user}@#{@hostname} 'ruby'") do |p|
+      p.puts $get_last_hashes
+      p.puts @root
+      JSON.parse(p.gets)
+    end
+  end
+  
+  def make_remote_directory_structure
+    IO.popen("ssh #{@user}@#{@hostname} 'ruby'") do |p|
+      p.puts @root
+      p.puts @datestamp
+      p.puts @directories.to_json
+    end
+  end
+  
+  def remote_link_copy
+  end
+  
+  def rsync_new_files
+  end
+  
+  def link_or_sync remote_hashes
+    @links = []
+    @syncs = []
+    @files.each do |f|
+      if remote_hashes[f] == @hash_table[f]
+        @links << f
+      else
+        @syncs << f
+      end
+    end
+  end
+  
   def make_hash_table
     @hash_table = {}
     @files.each do |f|
@@ -124,7 +160,15 @@ class Configuration
     s.setup
     s.walk_directories
     s.make_hash_table
-    print s.all_directories
+    remote_hashes = s.get_remote_hashes
+    s.make_remote_directory_structure
+    
+    s.link_or_sync(remote_hashes)
+    
+    puts "links"
+    print s.links
+    puts "syncs"
+    print s.syncs
   end
 end
 
@@ -168,27 +212,76 @@ def directory d, blacklist: nil, whitelist: nil
   @config.set.directory(d, blacklist, whitelist)
 end
 
+#Input order: bacup_root, datestamp, directories
 $build_directory_structure = <<'END_REMOTE_SCRIPT'
 require 'json'
 
-backup_root = gets.chomp
-datestamp = gets.chomp
-directories = JSON.parse(gets.chomp)
+def main
+  backup_root = gets.chomp
+  datestamp = gets.chomp
+  directories = JSON.parse(gets.chomp)
 
-directories.each {|d| Dir.mkdir(backup_root + "/" + datestamp + "/" + d) }
+  directories.each {|d| Dir.mkdir(backup_root + "/" + datestamp + "/" + d) }
+end
+
+main
 END_REMOTE_SCRIPT
 
+#Input order: backup_root
+#Output order: hashes.json
 $get_last_hashes = <<'END_REMOTE_SCRIPT'
 require 'find'
 
-backup_root = gets.chomp
+def main
 
-dirs = []
+  backup_root = gets.chomp
 
-Find.find (backup_root) do |path|
-  Find.prune if FileTest.directory?
-  dirs << File.basename(path)
+  dirs = []
+
+  Find.find (backup_root) do |path|
+    Find.prune if FileTest.directory?
+    dirs << File.basename(path)
+  end
+  puts IO.read("#{backup_root}/#{dirs.last}/.meta/hashes.json")
 end
 
-puts IO.read("#{backup_root}/#{dirs.last}/.meta/hashes.json")
+main
+END_REMOTE_SCRIPT
+
+#Input order: backup_root, syncs.json, links.json
+$copy_and_link = <<'END_REMOTE_SCRIPT'
+require 'find'
+
+def main
+  bacup_root = gets.chomp
+
+  dirs = []
+
+  Find.find (backup_root) do |path|
+    Find.prune if FileTest.directory?
+    dirs << File.basename(path)
+  end
+
+  old_root = dirs[-2]
+  new_root = dirs[-1]
+
+  syncs = JSON.parse(gets)
+  links = JSON.parse(gets)
+
+  f = File.open("#{backup_root}/#{new_root}/.meta/log")
+
+  links.each do |l|
+    r = system "ln #{backup_root}/#{old_root}/#{l} #{backup_root}/#{new_root}/#{l}"
+    f.puts "Linking #{l} - Return status #{r}"
+  end
+
+  syncs.each do |s|
+    r = system "cp #{backup_root}/#{old_root}/#{l} #{backup_root}/#{new_root}/#{l}"
+    f.puts "Copying #{l} - Return status #{r}"
+  end
+
+  f.close
+end
+
+main
 END_REMOTE_SCRIPT
